@@ -329,6 +329,9 @@ def make_grouped_bar_chart(
     ylabel: str = "",
     figsize: tuple[float, float] = (8, 4),
     color_map: dict[str, str] | None = None,
+    sparse: bool = False,
+    show_legend: bool = True,
+    use_tight_layout: bool = True,
 ) -> plt.Figure:
     """Grouped (clustered) bar chart for side-by-side comparison.
 
@@ -339,26 +342,58 @@ def make_grouped_bar_chart(
     """
     n_groups = len(groups)
     n_cats   = len(labels)
-    width    = 0.8 / n_groups   # Each bar's width inside the cluster
+    if not n_groups:
+        raise ValueError("Grouped bar chart requires at least one group.")
+    if any(len(values) != n_cats for values in groups.values()):
+        raise ValueError("Every group must provide one value per chart label.")
 
     fig, ax = plt.subplots(figsize=figsize)
     x_pos = list(range(n_cats))
 
-    for i, (group_name, values) in enumerate(groups.items()):
-        color  = (color_map or {}).get(group_name, _COLORS[i % len(_COLORS)])
-        offset = (i - (n_groups - 1) / 2) * width
-        positions = [x + offset for x in x_pos]
-        ax.bar(positions, values, width=width * 0.9,
-               color=color, label=group_name, zorder=2)
+    if sparse:
+        # For month-to-month Top N charts, each category has only a few real
+        # artists. Position those bars within the category and omit zero bars.
+        active_by_category = [
+            [name for name, values in groups.items() if values[category] != 0]
+            for category in range(n_cats)
+        ]
+        max_active = max((len(active) for active in active_by_category), default=1)
+        width = 0.8 / max(max_active, 1)
+        positions_by_artist: dict[str, list[float]] = {name: [] for name in groups}
+        values_by_artist: dict[str, list[float]] = {name: [] for name in groups}
+        for category, active in enumerate(active_by_category):
+            for rank, name in enumerate(active):
+                positions_by_artist[name].append(
+                    category + (rank - (len(active) - 1) / 2) * width
+                )
+                values_by_artist[name].append(groups[name][category])
+        for i, name in enumerate(groups):
+            if not positions_by_artist[name]:
+                continue
+            color = (color_map or {}).get(name, _COLORS[i % len(_COLORS)])
+            ax.bar(
+                positions_by_artist[name], values_by_artist[name],
+                width=width * 0.9, color=color,
+                label=name if show_legend else "_nolegend_", zorder=2,
+            )
+    else:
+        width = 0.8 / n_groups
+        for i, (group_name, values) in enumerate(groups.items()):
+            color  = (color_map or {}).get(group_name, _COLORS[i % len(_COLORS)])
+            offset = (i - (n_groups - 1) / 2) * width
+            positions = [x + offset for x in x_pos]
+            ax.bar(positions, values, width=width * 0.9,
+                   color=color, label=group_name, zorder=2)
 
     ax.set_xticks(x_pos)
     ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
 
-    legend = ax.legend(
-        fontsize=8, framealpha=0.3,
-        facecolor=_SURFACE, edgecolor=_BORDER,
-        labelcolor=_TEXT,
-    )
+    if show_legend:
+        ax.legend(
+            fontsize=8, framealpha=0.3,
+            facecolor=_SURFACE, edgecolor=_BORDER,
+            labelcolor=_TEXT,
+        )
 
     if xlabel:
         ax.set_xlabel(xlabel)
@@ -370,7 +405,10 @@ def make_grouped_bar_chart(
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     _apply_dark_style(ax, fig)
-    fig.tight_layout()
+    if use_tight_layout:
+        fig.tight_layout()
+    else:
+        fig.subplots_adjust(left=0.06, right=0.995, bottom=0.18, top=0.96)
     return fig
 
 

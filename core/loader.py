@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import csv
 import glob
+import json
 import os
 import sys
+import zipfile
 from datetime import datetime, timezone
 
 from core.models import Play
@@ -55,6 +57,24 @@ _EXTENDED_OPTIONAL = {"platform", "reason_start", "reason_end", "skipped"}
 # Minimum milliseconds to keep a row when skip_short=True.
 # 30 seconds filters out accidental taps and very short skips.
 _MIN_MS = 30_000
+
+_JSON_STATS_DEFAULTS = {
+    "audio_json_files": 0,
+    "raw_records": 0,
+    "valid_records": 0,
+    "filtered_too_short": 0,
+    "skipped_malformed": 0,
+    "deduplicated": 0,
+    "imported_records": 0,
+}
+
+
+def _prepare_json_stats(stats: dict | None) -> dict:
+    """Initialize optional caller-owned aggregate counters."""
+    target = stats if stats is not None else {}
+    for name, value in _JSON_STATS_DEFAULTS.items():
+        target.setdefault(name, value)
+    return target
 
 
 # ---------------------------------------------------------------------------
@@ -197,9 +217,186 @@ def _parse_extended_row(row: dict) -> Play:
     )
 
 
+def _parse_spotify_json_record(row: dict) -> Play:
+    """Map one Extended Streaming History audio JSON record into Play.
+
+    The field names here match the inspected export schema. Podcast,
+    audiobook, and other non-track rows commonly have no track artist/name
+    and are rejected because Tuneback's canonical Play represents music.
+    """
+    if not isinstance(row, dict):
+        raise ValueError("record is not an object")
+
+    timestamp = row.get("ts")
+    artist = row.get("master_metadata_album_artist_name")
+    track = row.get("master_metadata_track_name")
+    raw_ms = row.get("ms_played")
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        raise ValueError("missing timestamp")
+    if not isinstance(artist, str) or not artist.strip():
+        raise ValueError("missing track artist")
+    if not isinstance(track, str) or not track.strip():
+        raise ValueError("missing track name")
+    if isinstance(raw_ms, bool) or not isinstance(raw_ms, (int, str)):
+        raise ValueError("missing played duration")
+    try:
+        ms_played = int(raw_ms.strip() if isinstance(raw_ms, str) else raw_ms)
+    except ValueError as exc:
+        raise ValueError("played duration is not an integer") from exc
+    if ms_played < 0:
+        raise ValueError("played duration is negative")
+
+    def optional_text(field: str) -> str | None:
+        value = row.get(field)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError(f"optional field {field} is not text")
+        value = value.strip()
+        return value or None
+
+    raw_skipped = row.get("skipped")
+    if raw_skipped is None:
+        skipped = None
+    elif isinstance(raw_skipped, bool):
+        skipped = raw_skipped
+    elif isinstance(raw_skipped, str) and raw_skipped.lower() in {"true", "false"}:
+        skipped = raw_skipped.lower() == "true"
+    else:
+        raise ValueError("optional field skipped is not a boolean")
+
+    return Play(
+        timestamp=_parse_extended_timestamp(timestamp),
+        artist=artist.strip(),
+        track=track.strip(),
+        ms_played=ms_played,
+        platform=optional_text("platform"),
+        reason_start=optional_text("reason_start"),
+        reason_end=optional_text("reason_end"),
+        skipped=skipped,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def _load_spotify_json_stream(stream, source_name: str, skip_short: bool,
+                              stats: dict) -> list[Play]:
+    """Read one Spotify JSON document while updating aggregate diagnostics."""
+    try:
+        payload = json.load(stream)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        stats["skipped_malformed"] += 1
+        print(f"  [WARNING] Skipping malformed Spotify JSON file '{source_name}': {exc}")
+        return []
+
+    if not isinstance(payload, list):
+        stats["skipped_malformed"] += 1
+        print(f"  [WARNING] Spotify JSON file '{source_name}' does not contain a record list")
+        return []
+
+    plays: list[Play] = []
+    for row in payload:
+        stats["raw_records"] += 1
+        try:
+            play = _parse_spotify_json_record(row)
+        except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+            stats["skipped_malformed"] += 1
+            continue
+
+        stats["valid_records"] += 1
+        if skip_short and play.ms_played < _MIN_MS:
+            stats["filtered_too_short"] += 1
+            continue
+        plays.append(play)
+    return plays
+
+
+def _deduplicate(plays: list[Play], stats: dict | None = None) -> list[Play]:
+    """Apply the loader's established (timestamp, artist, track) key."""
+    seen: set[tuple] = set()
+    result: list[Play] = []
+    for play in plays:
+        key = (play.timestamp, play.artist, play.track)
+        if key in seen:
+            if stats is not None:
+                stats["deduplicated"] += 1
+            continue
+        seen.add(key)
+        result.append(play)
+    result.sort(key=lambda item: item.timestamp)
+    return result
+
+
+def _is_spotify_audio_json(name: str) -> bool:
+    """Recognize Spotify audio export members/files and reject video history."""
+    base = os.path.basename(name).lower()
+    return (
+        base.startswith("streaming_history_audio")
+        and base.endswith(".json")
+        and "streaming_history_video" not in base
+    )
+
+
+def load_json(path: str, skip_short: bool = True,
+              stats: dict | None = None) -> list[Play]:
+    """Load one Spotify Extended Streaming History audio JSON file.
+
+    ``stats`` may be a caller-owned dict. When provided it receives counts
+    for encountered, valid, filtered, malformed, deduplicated, and imported
+    JSON records. JSON record values are never included in warnings.
+    """
+    diagnostics = _prepare_json_stats(stats)
+    if "streaming_history_video" in os.path.basename(path).lower():
+        print("  [WARNING] Video history is not imported as music")
+        return []
+    diagnostics["audio_json_files"] += 1
+    try:
+        with open(path, "r", encoding="utf-8-sig") as stream:
+            plays = _load_spotify_json_stream(
+                stream, os.path.basename(path), skip_short, diagnostics
+            )
+    except OSError:
+        raise
+    result = _deduplicate(plays, diagnostics)
+    diagnostics["imported_records"] += len(result)
+    return result
+
+
+def load_zip(path: str, skip_short: bool = True,
+             stats: dict | None = None) -> list[Play]:
+    """Load audio JSON members directly from a Spotify export ZIP.
+
+    Files are streamed from the archive; nothing is extracted to disk.
+    Video JSON members and PDFs are ignored.
+    """
+    diagnostics = _prepare_json_stats(stats)
+    all_plays: list[Play] = []
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = [
+                name for name in archive.namelist()
+                if not name.endswith("/") and _is_spotify_audio_json(name)
+            ]
+            diagnostics["audio_json_files"] += len(names)
+            for name in sorted(names):
+                try:
+                    with archive.open(name) as stream:
+                        all_plays.extend(_load_spotify_json_stream(
+                            stream, os.path.basename(name), skip_short, diagnostics
+                        ))
+                except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+                    diagnostics["skipped_malformed"] += 1
+                    print(f"  [WARNING] Skipping unreadable Spotify JSON member '{os.path.basename(name)}': {exc}")
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"Cannot load '{path}': not a valid ZIP archive") from exc
+
+    result = _deduplicate(all_plays, diagnostics)
+    diagnostics["imported_records"] += len(result)
+    if not diagnostics["audio_json_files"]:
+        print("  [WARNING] No Spotify audio history JSON files found in ZIP")
+    return result
 
 def load_csv(path: str, skip_short: bool = True) -> list[Play]:
     """Load a single Spotify CSV export file and return a list of Play objects.
@@ -252,28 +449,33 @@ def load_csv(path: str, skip_short: bool = True) -> list[Play]:
     return plays
 
 
-def load_folder(folder_path: str, skip_short: bool = True) -> list[Play]:
-    """Load and merge all CSV files in a folder into a single Play list.
+def load_folder(folder_path: str, skip_short: bool = True,
+                stats: dict | None = None) -> list[Play]:
+    """Load and merge CSV and Spotify audio JSON files in a folder.
 
-    Files are discovered with a case-insensitive *.csv glob. Duplicate
-    plays — identical (timestamp, artist, track) tuples — are removed
-    to handle the case where users accidentally include the same file
-    twice or Spotify exports overlap.
+    JSON files are limited to Spotify ``Streaming_History_Audio*.json``;
+    video history is ignored. Duplicate plays — identical (timestamp,
+    artist, track) tuples — are removed across supported files.
 
     Parameters
     ----------
-    folder_path : Path to the folder containing the CSV files.
-    skip_short  : Passed through to load_csv for each file.
+    folder_path : Path containing CSVs and/or Spotify audio JSON files.
+    skip_short  : Passed through to each file loader.
+    stats       : Optional caller-owned aggregate diagnostics for JSON files.
 
     Returns
     -------
     list[Play], deduplicated and sorted ascending by timestamp.
     """
-    pattern = os.path.join(folder_path, "*.csv")
-    csv_files = sorted(glob.glob(pattern))
+    diagnostics = _prepare_json_stats(stats)
+    csv_files = sorted(glob.glob(os.path.join(folder_path, "*.csv")))
+    json_files = sorted(
+        path for path in glob.glob(os.path.join(folder_path, "*.json"))
+        if _is_spotify_audio_json(path)
+    )
 
-    if not csv_files:
-        print(f"  [WARNING] No CSV files found in '{folder_path}'")
+    if not csv_files and not json_files:
+        print(f"  [WARNING] No supported CSV or Spotify audio JSON files found in '{folder_path}'")
         return []
 
     all_plays: list[Play] = []
@@ -286,17 +488,17 @@ def load_folder(folder_path: str, skip_short: bool = True) -> list[Play]:
             print(f"  [WARNING] Skipping '{os.path.basename(csv_path)}': {exc}")
             continue
 
-    # Deduplicate by (timestamp, artist, track) — keep the first occurrence
-    # which preserves optional-field data from extended files when present.
-    seen: set[tuple] = set()
-    unique_plays: list[Play] = []
-    for play in all_plays:
-        key = (play.timestamp, play.artist, play.track)
-        if key not in seen:
-            seen.add(key)
-            unique_plays.append(play)
+    for json_path in json_files:
+        try:
+            batch = load_json(json_path, skip_short=skip_short, stats=diagnostics)
+            print(f"  Loaded {len(batch):>5} plays from Spotify audio JSON")
+            all_plays.extend(batch)
+        except (OSError, ValueError) as exc:
+            diagnostics["skipped_malformed"] += 1
+            print(f"  [WARNING] Skipping unreadable Spotify JSON file '{os.path.basename(json_path)}': {exc}")
 
-    unique_plays.sort(key=lambda p: p.timestamp)
+    unique_plays = _deduplicate(all_plays, diagnostics)
+    diagnostics["imported_records"] = len(unique_plays)
     return unique_plays
 
 
@@ -306,14 +508,20 @@ def load_folder(folder_path: str, skip_short: bool = True) -> list[Play]:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python -m core.loader <path-to-csv-or-folder>")
+        print("Usage: python -m core.loader <path-to-csv-json-zip-or-folder>")
         sys.exit(1)
 
     target = sys.argv[1]
 
     if os.path.isdir(target):
-        print(f"Loading all CSV files from folder: {target}")
+        print(f"Loading supported history files from folder: {target}")
         plays = load_folder(target)
+    elif target.lower().endswith(".zip"):
+        print("Loading Spotify audio JSON history from ZIP")
+        plays = load_zip(target)
+    elif target.lower().endswith(".json"):
+        print("Loading Spotify audio JSON history")
+        plays = load_json(target)
     else:
         print(f"Loading CSV file: {target}")
         plays = load_csv(target)
@@ -339,10 +547,12 @@ if __name__ == "__main__":
     print(f"  Date range     : {plays[0].timestamp:%Y-%m-%d}  →  {plays[-1].timestamp:%Y-%m-%d}")
     print()
 
-    # Top 5 artists by play count
-    from collections import Counter
-    top = Counter(p.artist for p in plays).most_common(5)
-    print("  Top 5 artists:")
-    for i, (artist, count) in enumerate(top, 1):
-        print(f"    {i}. {artist}  ({count:,} plays)")
-    print()
+    # Keep ZIP based validation summaries aggregate-only so personal names
+    # are not printed when checking a real Spotify export.
+    if not target.lower().endswith(".zip"):
+        from collections import Counter
+        top = Counter(p.artist for p in plays).most_common(5)
+        print("  Top 5 artists:")
+        for i, (artist, count) in enumerate(top, 1):
+            print(f"    {i}. {artist}  ({count:,} plays)")
+        print()

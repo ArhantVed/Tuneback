@@ -28,6 +28,18 @@ def sample_plays():
     ]
 
 
+def many_artist_plays():
+    plays = []
+    for period, prefix, day in ((2022, "A", 2), (2023, "B", 2)):
+        for rank in range(12):
+            for play_index in range(12 - rank):
+                plays.append(Play(
+                    datetime(period, 1, day, play_index // 60, play_index % 60),
+                    f"{prefix} Artist {rank:02d}", f"Track {play_index}", 60_000,
+                ))
+    return plays
+
+
 class PeriodComparisonAnalyserTests(unittest.TestCase):
     def test_no_data_and_empty_periods(self):
         result = Analyser([]).compare_periods(datetime(2022, 1, 1), datetime(2022, 2, 1), datetime(2023, 1, 1), datetime(2023, 2, 1))
@@ -137,13 +149,87 @@ class PeriodComparisonPageTests(unittest.TestCase):
         self.root.update_idletasks()
         self.assertEqual(self.page._comparison.period_a.total_plays, 1)
 
+    def test_top_artist_chart_is_capped_without_truncating_comparison_result(self):
+        self.page.refresh(Analyser(many_artist_plays()))
+        self.root.update_idletasks()
+
+        self.assertEqual(len(self.page._comparison.only_in_a), 12)
+        self.assertEqual(len(self.page._comparison.only_in_b), 12)
+        artists_a = self.page._analyser.top_artists(
+            5, self.page._period_bounds("Period A"),
+        )
+        artists_b = self.page._analyser.top_artists(
+            5, self.page._period_bounds("Period B"),
+        )
+        expected = {row[0] for row in artists_a} | {row[0] for row in artists_b}
+        categories = [tick.get_text() for tick in self.page._figure.axes[0].get_xticklabels()]
+        self.assertLessEqual(len(categories), 10)
+        self.assertEqual(set(categories), expected)
+        self.assertEqual(self.page._comparison.period_a.total_plays, 78)
+        self.assertEqual(self.page._comparison.period_b.total_plays, 78)
+
+    def test_what_changed_initial_batch_and_show_more_keep_full_data(self):
+        self.page.refresh(Analyser(many_artist_plays()))
+        self.root.update_idletasks()
+
+        expected = (
+            [("Only in Period A", artist) for artist in self.page._comparison.only_in_a]
+            + [("Only in Period B", artist) for artist in self.page._comparison.only_in_b]
+        )
+        self.assertEqual(len(expected), 24)
+        self.assertEqual(self.page._change_items, expected)
+        self.assertEqual(self.page._change_visible_count, 6)
+        self.assertEqual(self.page._change_summary.cget("text"), "Showing 6 of 24 changes")
+        self.assertEqual(len(self.page._change_content.winfo_children()), 7)
+        self.assertEqual(self.page._show_more_button.winfo_manager(), "pack")
+
+        self.page._show_more_button.invoke()
+        self.root.update_idletasks()
+        self.assertEqual(self.page._change_visible_count, 12)
+        self.assertEqual(self.page._change_summary.cget("text"), "Showing 12 of 24 changes")
+        self.page._show_more_button.invoke()
+        self.root.update_idletasks()
+        self.assertEqual(self.page._change_visible_count, 18)
+        self.page._show_more_button.invoke()
+        self.root.update_idletasks()
+        self.assertEqual(self.page._change_visible_count, 24)
+        self.assertEqual(self.page._show_more_button.winfo_manager(), "")
+        self.assertEqual(len(self.page._comparison.only_in_a), 12)
+        self.assertEqual(len(self.page._comparison.only_in_b), 12)
+
+    def test_period_changes_replace_results_and_chart_without_accumulation(self):
+        self.page.refresh(Analyser(sample_plays()))
+        menus = {key: pair for key, pair in self.page._range_menus.items()}
+        shell = self.page._shell
+        result_child_count = len(self.page._results.winfo_children())
+        self.assertEqual(len(plt.get_fignums()), 1)
+
+        for start_month in ("February", "January", "February", "January"):
+            self.page._range_vars[("Period A", "start")][1].set(start_month)
+            self.page._selection_changed()
+            self.root.update_idletasks()
+            self.assertEqual(len(plt.get_fignums()), 1)
+            self.assertEqual(len(self.page._results.winfo_children()), result_child_count)
+            self.assertIs(self.page._shell, shell)
+            for key, pair in menus.items():
+                self.assertIs(self.page._range_menus[key][0], pair[0])
+                self.assertIs(self.page._range_menus[key][1], pair[1])
+        self.assertEqual(self.page._comparison.period_a.total_plays, 3)
+
     def test_empty_range_chart_and_refresh_have_no_widget_or_figure_leaks(self):
         analyser = Analyser(sample_plays())
         self.page.refresh(analyser)
         initial_children = len(self.page.winfo_children())
+        option_menus = {
+            key: menus for key, menus in self.page._range_menus.items()
+        }
+        self.page.refresh(analyser)
         self.page.refresh(analyser)
         self.root.update_idletasks()
         self.assertEqual(len(self.page.winfo_children()), initial_children)
+        for key, menus in option_menus.items():
+            self.assertIs(self.page._range_menus[key][0], menus[0])
+            self.assertIs(self.page._range_menus[key][1], menus[1])
         self.assertEqual(len(plt.get_fignums()), 1)
         self.page._range_vars[("Period A", "start")][1].set("March")
         self.page._range_vars[("Period A", "end")][1].set("February")

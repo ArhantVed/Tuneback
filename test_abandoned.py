@@ -36,6 +36,20 @@ def abandoned_plays():
     return plays
 
 
+def many_abandoned_plays(artist_count=20):
+    """Build more than one visible page of quiet artists."""
+    latest = datetime(2024, 1, 1, 12)
+    plays = []
+    for artist_index in range(artist_count):
+        for play_index in range(10):
+            plays.append(Play(
+                datetime(2020, 1, 1) + timedelta(days=artist_index, minutes=play_index),
+                f"Artist {artist_index:02d}", f"Track {play_index}", 60_000,
+            ))
+    plays.append(Play(latest, "Recently Played", "Now", 60_000))
+    return plays
+
+
 class AbandonedAnalyserTests(unittest.TestCase):
     def test_no_data_and_minimal_history(self):
         self.assertEqual(Analyser([]).abandoned_artists(), [])
@@ -113,6 +127,48 @@ class AbandonedPageTests(unittest.TestCase):
         texts = self._texts(self.page)
         self.assertTrue(any("Old A" in text for text in texts))
         self.assertTrue(any("Quiet for" in text for text in texts))
+
+    def test_initial_render_and_load_more_are_paginated(self):
+        analyser = Analyser(many_abandoned_plays())
+        self.page.refresh(analyser)
+        self.root.update_idletasks()
+
+        self.assertEqual(len(self.page._artists), 20)
+        self.assertEqual(self.page._visible_count, 18)
+        self.assertEqual(len(self.page._grid.winfo_children()), 18)
+        self.assertEqual(self.page._load_more_button.winfo_manager(), "pack")
+        self.assertIn("20 artists found", self.page._result_summary.cget("text"))
+        self.assertIn("Showing 18 of 20", self.page._result_summary.cget("text"))
+        self.assertEqual(plt.get_fignums(), [])
+
+        self.page._load_more_button.invoke()
+        self.root.update_idletasks()
+        self.assertEqual(self.page._visible_count, 20)
+        self.assertEqual(len(self.page._grid.winfo_children()), 20)
+        self.assertEqual(self.page._load_more_button.winfo_manager(), "")
+        self.assertIn("Showing 20 of 20", self.page._result_summary.cget("text"))
+
+    def test_threshold_change_resets_to_first_batch(self):
+        self.page.refresh(Analyser(many_abandoned_plays()))
+        self.page._load_more()
+        self.assertEqual(self.page._visible_count, 20)
+
+        self.page._on_threshold_changed(185)
+        self.root.update_idletasks()
+
+        self.assertEqual(self.page._silence_days, 185)
+        self.assertEqual(self.page._visible_count, 18)
+        self.assertEqual(len(self.page._grid.winfo_children()), 18)
+        self.assertIn("Showing 18 of 20", self.page._result_summary.cget("text"))
+
+    def test_effective_threshold_noop_does_not_requery_or_rerender(self):
+        self.page.refresh(Analyser(many_abandoned_plays()))
+        grid_children = list(self.page._grid.winfo_children())
+        with patch.object(self.page._analyser, "abandoned_artists", wraps=self.page._analyser.abandoned_artists) as query:
+            self.page._on_threshold_changed(181)
+        query.assert_not_called()
+        self.assertEqual(self.page._silence_days, 180)
+        self.assertEqual(list(self.page._grid.winfo_children()), grid_children)
 
     def test_single_play_shows_no_matching_artist_state(self):
         self.page.refresh(Analyser([Play(datetime(2024, 1, 1), "Solo", "Only", 10_000)]))

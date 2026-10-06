@@ -16,6 +16,7 @@ class AbandonedPage(BasePage):
     MIN_PLAYS = 10
     MIN_SILENCE_DAYS = 90
     MAX_SILENCE_DAYS = 365
+    PAGE_SIZE = 18
 
     def refresh(self, analyser) -> None:
         """Rebuild page after navigation/data changes without retaining old charts."""
@@ -48,6 +49,11 @@ class AbandonedPage(BasePage):
         self._grid.pack(fill="both", expand=True, padx=theme.PAD_XL, pady=(0, theme.PAD_XL))
         for column in range(3):
             self._grid.grid_columnconfigure(column, weight=1, uniform="abandoned_cards")
+        self._load_more_button = customtkinter.CTkButton(
+            self._scroll, text="Load More", command=self._load_more,
+            fg_color=theme.SURFACE_RAISED, hover_color=theme.BORDER,
+            text_color=theme.TEXT, font=theme.label_style(theme.FONT_M),
+        )
         self._render_artists()
 
     def _build_header(self):
@@ -94,21 +100,26 @@ class AbandonedPage(BasePage):
         self._silence_label.pack(side="right")
 
     def _on_threshold_changed(self, value):
-        self._silence_days = int(round(float(value) / 5) * 5)
-        self._silence_days = min(max(self._silence_days, self.MIN_SILENCE_DAYS),
-                                 self.MAX_SILENCE_DAYS)
-        self._silence_var.set(self._silence_days)
-        self._silence_label.configure(text=f"{self._silence_days} days")
+        effective_days = int(round(float(value) / 5) * 5)
+        effective_days = min(max(effective_days, self.MIN_SILENCE_DAYS),
+                             self.MAX_SILENCE_DAYS)
+        if effective_days == self._silence_days:
+            return
+        self._silence_days = effective_days
+        self._silence_var.set(effective_days)
+        self._silence_label.configure(text=f"{effective_days} days")
         self._render_artists()
 
     def _render_artists(self):
-        """Re-query the analyser and rebuild only the result grid."""
+        """Analyze all matches, then render only the first page of cards."""
         for child in self._grid.winfo_children():
             child.destroy()
+        self._load_more_button.pack_forget()
         self._artists = self._analyser.abandoned_artists(
             min_plays=self.MIN_PLAYS,
             silence_days=self._silence_days,
         )
+        self._visible_count = 0
         if not self._artists:
             self._result_summary.configure(
                 text=(f"No artists have at least {self.MIN_PLAYS} plays and "
@@ -118,12 +129,36 @@ class AbandonedPage(BasePage):
 
         count = len(self._artists)
         self._result_summary.configure(
-            text=(f"{count} artist{'s' if count != 1 else ''} · "
-                  f"sorted by total plays · newest history date is "
-                  f"{date_label(self._analyser.first_and_last_play()[1].timestamp, 'day')}")
+            text=self._summary_text(count)
         )
-        for index, artist in enumerate(self._artists):
-            self._build_artist_card(index, artist)
+        self._render_next_batch()
+
+    def _summary_text(self, count: int) -> str:
+        shown = min(self._visible_count, count)
+        return (
+            f"{count} artist{'s' if count != 1 else ''} found · "
+            f"Showing {shown} of {count} · sorted by total plays · newest "
+            f"history date is "
+            f"{date_label(self._analyser.first_and_last_play()[1].timestamp, 'day')}"
+        )
+
+    def _render_next_batch(self) -> None:
+        start = self._visible_count
+        end = min(start + self.PAGE_SIZE, len(self._artists))
+        for index in range(start, end):
+            self._build_artist_card(index, self._artists[index])
+        self._visible_count = end
+        self._result_summary.configure(text=self._summary_text(len(self._artists)))
+        if end < len(self._artists):
+            self._load_more_button.pack(
+                padx=theme.PAD_XL, pady=(0, theme.PAD_XL), anchor="center",
+            )
+        else:
+            self._load_more_button.pack_forget()
+
+    def _load_more(self) -> None:
+        """Append the next result batch without disturbing existing cards."""
+        self._render_next_batch()
 
     def _build_artist_card(self, index, artist):
         card = customtkinter.CTkFrame(self._grid, **theme.card_style())

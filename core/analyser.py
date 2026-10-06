@@ -76,9 +76,13 @@ class Analyser:
         self._by_month: defaultdict[str, list[Play]] = defaultdict(list)
         # year int   ->  list[Play]
         self._by_year: defaultdict[int, list[Play]] = defaultdict(list)
+        # Cached query results built from the sorted play/index data.
+        self._first_heard_by_artist: dict[str, datetime] = {}
+        self._music_evolution_counts_cache: dict[tuple[str, int], dict[str, dict[str, int]]] = {}
 
         for play in self._plays:
             self._by_artist[play.artist].append(play)
+            self._first_heard_by_artist.setdefault(play.artist, play.timestamp)
             self._by_track[(play.track, play.artist)].append(play)
             month_key = f"{play.timestamp.year:04d}-{play.timestamp.month:02d}"
             self._by_month[month_key].append(play)
@@ -320,26 +324,36 @@ class Analyser:
         -------
         Ordered dict mapping period label -> [artist1, artist2, …].
         """
-        if granularity == "year":
-            key_fn = lambda p: p.timestamp.strftime("%Y")
-            groups = self._group_by(self._plays, key_fn)
-        else:  # month
-            key_fn = lambda p: p.timestamp.strftime("%Y-%m")
-            groups = self._group_by(self._plays, key_fn)
+        counts = self.music_evolution_counts_by_period(granularity, top_n)
+        return {period: list(period_counts) for period, period_counts in counts.items()}
 
-        result: dict[str, list[str]] = {}
-        for period_label in sorted(groups.keys()):
-            period_plays = groups[period_label]
-            artist_counts = Counter(p.artist for p in period_plays)
-            result[period_label] = [a for a, _ in artist_counts.most_common(top_n)]
-        return result
+    def music_evolution_counts_by_period(
+        self, granularity: str = "month", top_n: int = 3,
+    ) -> dict[str, dict[str, int]]:
+        """Return cached monthly/yearly top-artist names and play counts.
+
+        The existing period indexes avoid rescanning the full history for each
+        month. Returned dictionaries are copies so callers cannot mutate the
+        analyser's cached values.
+        """
+        granularity = "year" if granularity == "year" else "month"
+        cache_key = (granularity, top_n)
+        if cache_key not in self._music_evolution_counts_cache:
+            index = self._by_year if granularity == "year" else self._by_month
+            result: dict[str, dict[str, int]] = {}
+            for period_key in sorted(index):
+                period = str(period_key)
+                counts = Counter(play.artist for play in index[period_key])
+                result[period] = dict(counts.most_common(top_n))
+            self._music_evolution_counts_cache[cache_key] = result
+        return {
+            period: counts.copy()
+            for period, counts in self._music_evolution_counts_cache[cache_key].items()
+        }
 
     def first_heard_by_artist(self) -> dict[str, datetime]:
-        """Return a dict mapping each artist name to their first-ever play timestamp."""
-        return {
-            artist: min(p.timestamp for p in plays)
-            for artist, plays in self._by_artist.items()
-        }
+        """Return a copy of the indexed first-ever timestamp for each artist."""
+        return self._first_heard_by_artist.copy()
 
     # ====================================================================
     # Obsession detection

@@ -21,13 +21,14 @@ Python concepts: OOP encapsulation, callback pattern, tkinter layout.
 from __future__ import annotations
 
 import os
+import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import customtkinter
 
 import ui.theme as theme  # side-effect: sets CTk appearance mode
 from core.analyser import Analyser
-from core.loader import load_csv, load_folder
+from core.loader import load_csv, load_folder, load_json, load_zip
 from ui.sidebar import Sidebar
 from ui.pages.dashboard import DashboardPage
 from ui.pages.time_machine import TimeMachinePage
@@ -56,6 +57,9 @@ class App(customtkinter.CTk):
 
     def __init__(self) -> None:
         super().__init__()
+
+        self._is_closing = False
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.title("Tuneback")
         self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
@@ -142,7 +146,7 @@ class App(customtkinter.CTk):
         ----------
         key : One of the page keys defined in page_classes above.
         """
-        if key not in self._pages:
+        if self._is_closing or key not in self._pages:
             return
 
         # Hide all pages
@@ -163,17 +167,20 @@ class App(customtkinter.CTk):
     # ====================================================================
 
     def _on_load_data(self) -> None:
-        """Open a file dialog, load CSVs, build Analyser, refresh current page.
+        """Open a file dialog, load supported history, refresh current page.
 
         The user can select either:
-          - A folder containing one or more Spotify CSV export files, OR
-          - A single CSV file.
+          - A folder containing Spotify CSV/audio JSON history, OR
+          - A CSV file, audio JSON file, or Spotify export ZIP.
 
         A folder dialog is shown first; if cancelled, a file dialog is shown.
         """
+        if self._is_closing:
+            return
+
         # Try folder selection first
         folder = filedialog.askdirectory(
-            title="Select folder containing Spotify CSV exports",
+            title="Select folder containing Spotify history files",
             mustexist=True,
         )
 
@@ -188,14 +195,25 @@ class App(customtkinter.CTk):
         else:
             # Folder dialog cancelled — try a single file instead
             filepath = filedialog.askopenfilename(
-                title="Select a Spotify CSV export file",
-                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+                title="Select a Spotify history export",
+                filetypes=[
+                    ("Spotify export ZIP", "*.zip"),
+                    ("Spotify audio JSON", "*.json"),
+                    ("CSV files", "*.csv"),
+                    ("All files", "*.*"),
+                ],
             )
             if not filepath:
                 return  # Both dialogs cancelled — do nothing
 
             try:
-                plays = load_csv(filepath)
+                extension = os.path.splitext(filepath)[1].lower()
+                if extension == ".zip":
+                    plays = load_zip(filepath)
+                elif extension == ".json":
+                    plays = load_json(filepath)
+                else:
+                    plays = load_csv(filepath)
             except Exception as exc:
                 messagebox.showerror("Load Error", str(exc))
                 return
@@ -205,7 +223,7 @@ class App(customtkinter.CTk):
             messagebox.showwarning(
                 "No Data",
                 f"No valid play records were found in:\n{source_label}\n\n"
-                "Make sure the file is a Spotify StreamingHistory CSV export.",
+                "Make sure the selection contains Spotify CSV or Extended Streaming History audio JSON data.",
             )
             return
 
@@ -219,3 +237,34 @@ class App(customtkinter.CTk):
         self.title(
             f"Tuneback  —  {len(plays):,} plays  |  {source_label}"
         )
+
+    # ====================================================================
+    # Orderly shutdown
+    # ====================================================================
+
+    def _on_close(self) -> None:
+        """Cancel pending Tk work, then destroy the root exactly once."""
+        if self._is_closing:
+            return
+        self._is_closing = True
+        try:
+            self._cancel_pending_after_callbacks()
+        finally:
+            # Tuneback owns no Configure bindings to remove; CustomTkinter
+            # manages its own widget bindings during normal destruction.
+            super().destroy()
+
+    def _cancel_pending_after_callbacks(self) -> None:
+        """Cancel all interpreter-level after/after_idle jobs during shutdown."""
+        try:
+            pending = self.tk.call("after", "info")
+        except tk.TclError:
+            return
+        if isinstance(pending, str):
+            pending = self.tk.splitlist(pending) if pending else ()
+        for callback_id in pending:
+            try:
+                self.after_cancel(callback_id)
+            except tk.TclError:
+                # A callback may already have completed between info and cancel.
+                pass

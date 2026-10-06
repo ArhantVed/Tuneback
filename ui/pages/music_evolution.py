@@ -1,7 +1,7 @@
 """Tuneback Music Evolution page: monthly artist rankings and discoveries."""
 from __future__ import annotations
 
-from datetime import datetime
+import tkinter as tk
 
 import customtkinter
 import matplotlib.pyplot as plt
@@ -12,36 +12,40 @@ from utils.chart_helpers import embed_figure, make_grouped_bar_chart
 from utils.formatting import month_label
 
 
-def _timeline_series(analyser, year: str | None = None) -> tuple[list[str], dict[str, list[int]]]:
-    """Build aligned monthly top-three counts using Analyser results only."""
-    evolution = analyser.music_evolution_by_period("month", top_n=3)
-    periods = [key for key in evolution if year is None or key.startswith(year)]
-    all_dates = analyser.first_heard_by_artist()
-    artist_order = sorted(all_dates, key=lambda artist: (all_dates[artist], artist.casefold()))
-    visible_artists = {
-        artist for key in periods for artist in evolution[key]
-    }
-    series = {artist: [0] * len(periods) for artist in artist_order
-              if artist in visible_artists}
+DISCOVERY_PAGE_SIZE = 18
 
-    for index, key in enumerate(periods):
-        month = int(key[-2:])
-        start = datetime(int(key[:4]), month, 1)
-        end = datetime(start.year + (month == 12), 1 if month == 12 else month + 1, 1)
-        ranked = analyser.top_artists(3, period=(start, end))
-        counts = {artist: count for artist, count, _ in ranked}
-        for artist in evolution[key]:
-            if artist in series:
-                series[artist][index] = counts.get(artist, 0)
+
+def _timeline_series(
+    analyser, year: str | None = None,
+    first_heard: dict | None = None,
+    evolution_counts: dict[str, dict[str, int]] | None = None,
+) -> tuple[list[str], dict[str, list[int]]]:
+    """Build aligned monthly Top 3 counts from the analyser's month index."""
+    evolution_counts = evolution_counts or analyser.music_evolution_counts_by_period(
+        "month", top_n=3,
+    )
+    periods = [key for key in evolution_counts if year is None or key.startswith(year)]
+    if first_heard is None:
+        first_heard = analyser.first_heard_by_artist()
+    artist_order = sorted(first_heard, key=lambda artist: (first_heard[artist], artist.casefold()))
+    visible_artists = {
+        artist for key in periods for artist in evolution_counts[key]
+    }
+    series = {
+        artist: [evolution_counts[key].get(artist, 0) for key in periods]
+        for artist in artist_order if artist in visible_artists
+    }
     return periods, series
 
 
 class MusicEvolutionPage(BasePage):
     """Explore each month's leading artists and artists first heard by year."""
 
+    DISCOVERY_PAGE_SIZE = DISCOVERY_PAGE_SIZE
+
     def refresh(self, analyser) -> None:
+        self._close_timeline_chart()
         self._clear()
-        plt.close("all")
         if analyser is None:
             self.show_placeholder("Load your Spotify data to explore Music Evolution")
             return
@@ -49,6 +53,14 @@ class MusicEvolutionPage(BasePage):
             self.show_placeholder("No listening history found")
             return
         self._analyser = analyser
+        self._first_heard = analyser.first_heard_by_artist()
+        self._evolution_counts = analyser.music_evolution_counts_by_period(
+            "month", top_n=3,
+        )
+        self._discoveries = sorted(
+            self._first_heard.items(),
+            key=lambda item: (item[1], item[0].casefold()),
+        )
         self._build()
 
     def _build(self):
@@ -93,13 +105,15 @@ class MusicEvolutionPage(BasePage):
         self._render()
 
     def _render(self):
+        self._close_timeline_chart()
         for child in self._body.winfo_children():
             child.destroy()
-        plt.close("all")
 
         selected = self._year_var.get()
         year = None if selected == "All years" else selected
-        periods, series = _timeline_series(self._analyser, year)
+        periods, series = _timeline_series(
+            self._analyser, year, self._first_heard, self._evolution_counts,
+        )
         if not periods:
             self._empty_state()
             return
@@ -129,9 +143,10 @@ class MusicEvolutionPage(BasePage):
         ).pack(anchor="w", padx=theme.PAD_L, pady=(0, theme.PAD_S))
 
         chart_width = max(9.0, min(0.85 * len(periods), 32.0))
-        first_heard = self._analyser.first_heard_by_artist()
-        all_artists = sorted(first_heard,
-                             key=lambda artist: (first_heard[artist], artist.casefold()))
+        all_artists = sorted(
+            self._first_heard,
+            key=lambda artist: (self._first_heard[artist], artist.casefold()),
+        )
         color_map = {
             artist: theme.CHART_COLORS[index % len(theme.CHART_COLORS)]
             for index, artist in enumerate(all_artists)
@@ -139,7 +154,8 @@ class MusicEvolutionPage(BasePage):
         fig = make_grouped_bar_chart(
             labels=[month_label(period) for period in periods], groups=series,
             title="", ylabel="Plays", figsize=(chart_width, 4.2),
-            color_map=color_map,
+            color_map=color_map, sparse=True, show_legend=False,
+            use_tight_layout=False,
         )
         self._timeline_figure = fig
         horizontal = customtkinter.CTkScrollableFrame(
@@ -162,25 +178,43 @@ class MusicEvolutionPage(BasePage):
             card, text=heading, font=theme.label_style(theme.FONT_M, bold=True),
             text_color=theme.TEXT,
         ).pack(anchor="w", padx=theme.PAD_L, pady=(theme.PAD_L, theme.PAD_S))
-        first_heard = self._analyser.first_heard_by_artist()
-        discoveries = sorted(
-            ((artist, heard) for artist, heard in first_heard.items()
-             if year is None or str(heard.year) == year),
-            key=lambda item: (item[1], item[0].casefold()),
-        )
-        if not discoveries:
+        self._visible_discoveries = [
+            item for item in self._discoveries
+            if year is None or str(item[1].year) == year
+        ]
+        if not self._visible_discoveries:
             customtkinter.CTkLabel(
                 card, text="No new artist discoveries for this year.",
                 font=theme.label_style(theme.FONT_S), text_color=theme.TEXT_MUTED,
             ).pack(anchor="w", padx=theme.PAD_L, pady=(0, theme.PAD_L))
             return
 
+        self._discovery_count = len(self._visible_discoveries)
+        self._discovery_visible_count = 0
+        self._discovery_summary = customtkinter.CTkLabel(
+            card, text="", anchor="w", font=theme.label_style(theme.FONT_S),
+            text_color=theme.TEXT_MUTED,
+        )
+        self._discovery_summary.pack(anchor="w", padx=theme.PAD_L, pady=(0, theme.PAD_S))
         list_frame = customtkinter.CTkScrollableFrame(
             card, fg_color=theme.SURFACE, height=190,
         )
         list_frame.pack(fill="x", padx=theme.PAD_S, pady=(0, theme.PAD_S))
-        for artist, heard in discoveries:
-            row = customtkinter.CTkFrame(list_frame, fg_color="transparent")
+        self._discovery_list = list_frame
+        self._load_more_button = customtkinter.CTkButton(
+            card, text="Load More", command=self._load_more_discoveries,
+            fg_color=theme.SURFACE_RAISED, hover_color=theme.BORDER,
+            text_color=theme.TEXT, font=theme.label_style(theme.FONT_S),
+        )
+        self._render_discovery_batch()
+
+    def _render_discovery_batch(self):
+        end = min(
+            self._discovery_visible_count + self.DISCOVERY_PAGE_SIZE,
+            self._discovery_count,
+        )
+        for artist, heard in self._visible_discoveries[self._discovery_visible_count:end]:
+            row = customtkinter.CTkFrame(self._discovery_list, fg_color="transparent")
             row.pack(fill="x", padx=theme.PAD_S, pady=2)
             customtkinter.CTkLabel(
                 row, text=artist, anchor="w", font=theme.label_style(theme.FONT_S),
@@ -190,3 +224,28 @@ class MusicEvolutionPage(BasePage):
                 row, text=heard.strftime("%b %d, %Y"), anchor="e",
                 font=theme.label_style(theme.FONT_S), text_color=theme.TEXT_MUTED,
             ).pack(side="right")
+        self._discovery_visible_count = end
+        self._discovery_summary.configure(
+            text=(f"Showing {end} of {self._discovery_count} artist"
+                  f"{'s' if self._discovery_count != 1 else ''}")
+        )
+        if end < self._discovery_count:
+            self._load_more_button.pack(pady=(0, theme.PAD_M))
+        else:
+            self._load_more_button.pack_forget()
+
+    def _load_more_discoveries(self):
+        self._render_discovery_batch()
+
+    def _close_timeline_chart(self):
+        canvas = getattr(self, "_timeline_canvas", None)
+        if canvas is not None:
+            try:
+                canvas.get_tk_widget().destroy()
+            except (tk.TclError, AttributeError):
+                pass
+            self._timeline_canvas = None
+        figure = getattr(self, "_timeline_figure", None)
+        if figure is not None:
+            plt.close(figure)
+            self._timeline_figure = None
